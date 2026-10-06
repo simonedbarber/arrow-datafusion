@@ -389,7 +389,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     set_quantifier,
                     SetQuantifier::All | SetQuantifier::AllByName
                 );
-                match op {
+                let plan = match op {
                     SetOperator::Union if all => LogicalPlanBuilder::from(left_plan)
                         .union(right_plan)?
                         .build(),
@@ -406,9 +406,18 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         "Set operator {:?} is not implemented",
                         op
                     ))),
+                }?;
+                // A CTE's alias belongs to the complete set result, rather
+                // than either arm. Retain it for qualified consumers just as
+                // select_to_plan does for an ordinary SELECT CTE.
+                match alias {
+                    Some(alias) => {
+                        project_with_alias(plan, vec![Expr::Wildcard], Some(alias))
+                    }
+                    None => Ok(plan),
                 }
             }
-            SetExpr::Query(q) => self.query_to_plan_with_alias(*q, None),
+            SetExpr::Query(q) => self.query_to_plan_with_alias(*q, alias),
             _ => Err(DataFusionError::NotImplemented(format!(
                 "Query {} not implemented yet",
                 set_expr
@@ -1877,15 +1886,15 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 match expr {
                     // optimization: if it's a number literal, we apply the negative operator
                     // here directly to calculate the new literal.
-                    SQLExpr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => match n.parse::<i64>() {
-                        Ok(n) => Ok(Box::new(lit(-n))),
-                        Err(_) => Ok(Box::new(lit(-n
-                            .parse::<f64>()
-                            .map_err(|_e| {
-                                DataFusionError::Internal(format!(
-                                    "negative operator can be only applied to integer and float operands, got: {}",
-                                    n))
-                            })?))),
+                    SQLExpr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => {
+                        // Parse the signed text before selecting its domain. Negating
+                        // a rounded f64 loses values just below Int64::MIN, while
+                        // negating Int64::MIN directly can overflow in Rust.
+                        let signed = match n.strip_prefix('-') {
+                            Some(unsigned) => unsigned.to_string(),
+                            None => format!("-{}", n.strip_prefix('+').unwrap_or(&n)),
+                        };
+                        parse_sql_number(&signed).map(Box::new)
                     },
                     // not a literal, apply negative operator on expression
                     _ => Ok(Box::new(Expr::Negative(self.sql_expr_to_logical_expr(expr, schema, extended_schema)?))),
@@ -3639,10 +3648,29 @@ fn exact_number_info_to_precision_scale(
 
 // Parse number in sql string, convert to Expr::Literal
 fn parse_sql_number(n: &str) -> Result<Expr> {
-    match n.parse::<i64>() {
-        Ok(n) => Ok(lit(n)),
-        Err(_) => Ok(lit(n.parse::<f64>().unwrap())),
+    if let Ok(value) = n.parse::<i64>() {
+        return Ok(lit(value));
     }
+    let digits = n.strip_prefix('-').or_else(|| n.strip_prefix('+')).unwrap_or(n);
+    if !digits.is_empty() && digits.bytes().all(|digit| digit.is_ascii_digit()) {
+        // SQL integer text outside Int64 is still exact. Use the existing
+        // Decimal128 domain rather than passing through f64 before a cast.
+        // Beyond this engine's precision, fail instead of rounding a literal.
+        let precision = digits.trim_start_matches('0').len().max(1);
+        if precision > DECIMAL_MAX_PRECISION {
+            return Err(DataFusionError::Plan(format!(
+                "Integer literal {} exceeds the native decimal precision {}",
+                n, DECIMAL_MAX_PRECISION
+            )));
+        }
+        let value = n.parse::<i128>().map_err(|_| {
+            DataFusionError::Plan(format!("Integer literal {} is out of range", n))
+        })?;
+        return Ok(Expr::Literal(ScalarValue::try_new_decimal128(value, precision, 0)?));
+    }
+    n.parse::<f64>().map(lit).map_err(|_| {
+        DataFusionError::Plan(format!("Invalid SQL number literal {}", n))
+    })
 }
 
 /// Work item for the iterative binary-operator evaluation in
@@ -5442,6 +5470,32 @@ mod tests {
             \n        Projection: Float64(1.1) AS a, alias=x\
             \n          EmptyRelation";
         quick_test(sql, expected);
+    }
+
+    #[test]
+    fn qualified_set_cte_alias_survives_complete_union() {
+        for operator in ["UNION", "UNION ALL"] {
+            let sql = format!(
+                "WITH grid AS (SELECT 1 AS \"source.key\" {operator} SELECT 2 AS \"different.key\") \
+                 SELECT grid.\"source.key\" FROM grid"
+            );
+            let plan = logical_plan(&sql).unwrap();
+            assert_eq!(plan.schema().field(0).name(), "source.key");
+            assert!(format!("{:?}", plan).contains("alias=grid"));
+        }
+    }
+
+    #[test]
+    fn qualified_set_cte_alias_survives_nested_query_and_consumer() {
+        let sql = "WITH grid AS ((SELECT 1 AS \"source.key\" UNION SELECT 2.5 AS \"source.key\")), \
+                   attached AS (SELECT grid.\"source.key\" FROM grid) \
+                   SELECT attached.\"source.key\" FROM attached ORDER BY attached.\"source.key\" LIMIT 1";
+        let plan = logical_plan(sql).unwrap();
+        assert_eq!(plan.schema().field(0).name(), "source.key");
+        let printed = format!("{:?}", plan);
+        assert!(printed.contains("alias=grid"));
+        assert!(printed.contains("alias=attached"));
+        assert!(printed.contains("Float64"));
     }
 
     #[test]

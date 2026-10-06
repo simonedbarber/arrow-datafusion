@@ -536,7 +536,10 @@ pub fn signature(fun: &BuiltinScalarFunction) -> Signature {
         ),
 
         BuiltinScalarFunction::NullIf => {
-            Signature::uniform(2, SUPPORTED_NULLIF_TYPES.to_vec(), fun.volatility())
+            Signature::new(
+                TypeSignature::UniformOrDecimal(2, SUPPORTED_NULLIF_TYPES.to_vec()),
+                fun.volatility(),
+            )
         }
         BuiltinScalarFunction::RegexpMatch => Signature::one_of(
             vec![

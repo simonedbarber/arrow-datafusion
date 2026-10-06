@@ -467,7 +467,24 @@ fn coercion_decimal_mathematics_type(
                     let result_scale = 6.max(*s1 + *p2 + 1);
                     // p1 - s1 + s2 + max(6, s1 + p2 + 1)
                     let result_precision = result_scale + *p1 - *s1 + *s2;
-                    Some(create_decimal_type(result_precision, result_scale))
+                    // The physical expression casts BOTH operands to this
+                    // common type before dividing. Capping precision and scale
+                    // independently can turn DECIMAL(38,9) into (38,38), which
+                    // cannot even represent the integer 2. Reserve the integer
+                    // capacity of both inputs before allocating fractional
+                    // digits; never overflow an operand merely to widen output.
+                    let input_integer_digits = (*p1 - *s1).max(*p2 - *s2);
+                    let scale = result_scale.min(DECIMAL_MAX_PRECISION - input_integer_digits);
+                    if scale < *s1.max(s2) {
+                        // No decimal128 common type can retain both operands.
+                        // Refuse coercion rather than truncate a denominator
+                        // to zero or silently discard fractional input digits.
+                        return None;
+                    }
+                    let precision = (result_precision - (result_scale - scale))
+                        .max(input_integer_digits + scale)
+                        .min(DECIMAL_MAX_PRECISION);
+                    Some(create_decimal_type(precision, scale))
                 }
                 Operator::Modulo => {
                     // max(s1, s2)
@@ -987,7 +1004,9 @@ mod tests {
             &left_decimal_type,
             &right_decimal_type,
         );
-        assert_eq!(DataType::Decimal(35, 24), result.unwrap());
+        // Both operands must fit the common physical type, including the
+        // right operand's sixteen integer digits.
+        assert_eq!(DataType::Decimal(38, 22), result.unwrap());
         let op = Operator::Modulo;
         let result = coercion_decimal_mathematics_type(
             &op,
@@ -995,6 +1014,21 @@ mod tests {
             &right_decimal_type,
         );
         assert_eq!(DataType::Decimal(11, 4), result.unwrap());
+    }
+
+    #[test]
+    fn test_decimal_division_preserves_operand_integer_capacity() {
+        let decimal = DataType::Decimal(38, 9);
+        assert_eq!(
+            coercion_decimal_mathematics_type(&Operator::Divide, &decimal, &decimal),
+            Some(DataType::Decimal(38, 9))
+        );
+        let integer_decimal = DataType::Decimal(38, 0);
+        assert_eq!(
+            coercion_decimal_mathematics_type(&Operator::Divide, &integer_decimal, &decimal),
+            None
+        );
+        assert!(coerce_types(&integer_decimal, &Operator::Divide, &decimal).is_err());
     }
 
     #[test]

@@ -90,6 +90,38 @@ fn get_valid_types(
             .iter()
             .map(|valid_type| (0..*number).map(|_| valid_type.clone()).collect())
             .collect(),
+        TypeSignature::UniformOrDecimal(number, valid_types) => {
+            if current_types.len() != *number {
+                return Err(DataFusionError::Plan(format!(
+                    "The function expected {} arguments but received {}",
+                    number, current_types.len()
+                )));
+            }
+            if current_types.iter().any(|t| matches!(t, DataType::Decimal(_, _))) {
+                let mut integer_digits = 0;
+                let mut scale = 0;
+                for current_type in current_types {
+                    if matches!(current_type, DataType::Null) {
+                        continue;
+                    }
+                    let (precision, current_scale) = decimal_precision_scale(current_type)
+                        .ok_or_else(|| DataFusionError::Plan(format!(
+                            "Cannot preserve decimal arguments with {:?}", current_type
+                        )))?;
+                    integer_digits = integer_digits.max(precision - current_scale);
+                    scale = scale.max(current_scale);
+                }
+                let precision = integer_digits + scale;
+                if precision > 38 {
+                    return Err(DataFusionError::Plan(
+                        "Decimal arguments require more than 38 digits without loss".into()
+                    ));
+                }
+                vec![vec![DataType::Decimal(precision, scale); *number]]
+            } else {
+                get_valid_types(&TypeSignature::Uniform(*number, valid_types.clone()), current_types)?
+            }
+        }
         TypeSignature::VariadicEqual => {
             // one entry with the same len as current_types, whose type is `current_types[0]`.
             vec![current_types
@@ -146,6 +178,19 @@ fn maybe_data_types(
     Some(new_type)
 }
 
+/// Decimal capacity required to represent an exact numeric argument.
+fn decimal_precision_scale(data_type: &DataType) -> Option<(usize, usize)> {
+    match data_type {
+        DataType::Decimal(p, s) if *p > 0 && *p <= 38 && *s <= *p => Some((*p, *s)),
+        DataType::Int8 | DataType::UInt8 => Some((3, 0)),
+        DataType::Int16 | DataType::UInt16 => Some((5, 0)),
+        DataType::Int32 | DataType::UInt32 => Some((10, 0)),
+        DataType::Int64 => Some((19, 0)),
+        DataType::UInt64 => Some((20, 0)),
+        _ => None,
+    }
+}
+
 /// Return true if a value of type `type_from` can be coerced
 /// (losslessly converted) into a value of `type_to`
 ///
@@ -158,6 +203,10 @@ pub fn can_coerce_from(type_into: &DataType, type_from: &DataType) -> bool {
     }
     // Null can convert to most of types
     match type_into {
+        Decimal(precision, scale) => matches!(type_from, Null)
+            || decimal_precision_scale(type_from).map_or(false, |(p, s)| {
+                scale <= precision && scale >= &s && precision - scale >= p - s
+            }),
         Int8 => matches!(type_from, Null | Int8),
         Int16 => matches!(type_from, Null | Int8 | Int16 | UInt8),
         Int32 => matches!(type_from, Null | Int8 | Int16 | Int32 | UInt8 | UInt16),
@@ -208,6 +257,73 @@ pub fn can_coerce_from(type_into: &DataType, type_from: &DataType) -> bool {
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
+
+    #[test]
+    fn test_nullif_decimal_coercion_preserves_exact_capacity() -> Result<()> {
+        let fun = crate::BuiltinScalarFunction::NullIf;
+        let signature = crate::function::signature(&fun);
+        for (input, output) in [
+            (
+                vec![DataType::Decimal(38, 9), DataType::Decimal(38, 9)],
+                DataType::Decimal(38, 9),
+            ),
+            (
+                vec![DataType::Decimal(38, 9), DataType::Null],
+                DataType::Decimal(38, 9),
+            ),
+            (
+                vec![DataType::Null, DataType::Decimal(38, 9)],
+                DataType::Decimal(38, 9),
+            ),
+            (
+                vec![DataType::Decimal(10, 3), DataType::Decimal(20, 4)],
+                DataType::Decimal(20, 4),
+            ),
+            (
+                vec![DataType::Decimal(38, 9), DataType::Int64],
+                DataType::Decimal(38, 9),
+            ),
+            (
+                vec![DataType::UInt64, DataType::Decimal(10, 9)],
+                DataType::Decimal(29, 9),
+            ),
+        ] {
+            assert_eq!(data_types(&input, &signature)?, vec![output.clone(); 2]);
+            assert_eq!(crate::function::return_type(&fun, &input)?, output);
+        }
+        for input in [
+            vec![DataType::Decimal(38, 0), DataType::Decimal(38, 9)],
+            vec![DataType::Decimal(38, 9), DataType::Float64],
+            vec![DataType::Decimal(38, 9)],
+        ] {
+            assert!(data_types(&input, &signature).is_err(), "{:?}", input);
+        }
+        assert!(!can_coerce_from(
+            &DataType::Decimal(10, 3),
+            &DataType::Decimal(20, 4)
+        ));
+        assert!(!can_coerce_from(
+            &DataType::Decimal(10, 3),
+            &DataType::Int64
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_nullif_existing_types_keep_their_coercion() -> Result<()> {
+        let signature = crate::function::signature(&crate::BuiltinScalarFunction::NullIf);
+        for (input, output) in [
+            (vec![DataType::Int8, DataType::Int16], DataType::Int16),
+            (
+                vec![DataType::Float32, DataType::Float64],
+                DataType::Float64,
+            ),
+            (vec![DataType::Utf8, DataType::Utf8], DataType::Utf8),
+        ] {
+            assert_eq!(data_types(&input, &signature)?, vec![output; 2]);
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_maybe_data_types() {

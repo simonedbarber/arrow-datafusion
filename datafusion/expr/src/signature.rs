@@ -50,6 +50,9 @@ pub enum TypeSignature {
     // A function of one argument of f64 is `Uniform(1, vec![DataType::Float64])`
     // A function of one argument of f64 or f32 is `Uniform(1, vec![DataType::Float32, DataType::Float64])`
     Uniform(usize, Vec<DataType>),
+    /// Fixed arguments of a supported common type, preserving decimal precision
+    /// and scale whenever an argument is decimal.
+    UniformOrDecimal(usize, Vec<DataType>),
     /// exact number of arguments of an exact type
     Exact(Vec<DataType>),
     /// fixed number of arguments of arbitrary types

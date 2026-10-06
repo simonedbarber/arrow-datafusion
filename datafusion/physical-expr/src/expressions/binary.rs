@@ -402,18 +402,68 @@ fn multiply_decimal(left: &DecimalArray, right: &DecimalArray) -> Result<Decimal
     Ok(decimal_builder.finish())
 }
 
+/// Divide equal-scale decimal operands without a binary-float conversion or
+/// overflowing `numerator * 10^scale`. Long division keeps every remainder
+/// below the denominator; checked output growth rejects unrepresentable values.
+/// Fractional digits beyond the declared output scale truncate toward zero.
+fn divide_decimal_exact(left: i128, right: i128, precision: usize, scale: usize) -> Result<i128> {
+    if right == 0 {
+        return Err(DataFusionError::ArrowError(DivideByZero));
+    }
+    let magnitude = |value: i128| {
+        if value < 0 {
+            value.wrapping_neg() as u128
+        } else {
+            value as u128
+        }
+    };
+    let numerator = magnitude(left);
+    let denominator = magnitude(right);
+    let mut value = numerator / denominator;
+    let mut remainder = numerator % denominator;
+    let overflow = || {
+        DataFusionError::Execution("Decimal division result exceeds declared precision".to_string())
+    };
+    for _ in 0..scale {
+        // Compute remainder * 10 / denominator with bounded additions. The
+        // direct product may exceed u128 even when the final quotient fits.
+        let mut next_remainder = 0;
+        let mut digit = 0;
+        for _ in 0..10 {
+            if next_remainder >= denominator - remainder {
+                next_remainder -= denominator - remainder;
+                digit += 1;
+            } else {
+                next_remainder += remainder;
+            }
+        }
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(digit))
+            .ok_or_else(overflow)?;
+        remainder = next_remainder;
+    }
+    if value >= 10_u128.pow(precision as u32) {
+        return Err(overflow());
+    }
+    let value = value as i128;
+    Ok(if (left < 0) != (right < 0) {
+        -value
+    } else {
+        value
+    })
+}
+
 fn divide_decimal_scalar(left: &DecimalArray, right: i128) -> Result<DecimalArray> {
     let mut decimal_builder =
         DecimalBuilder::new(left.len(), left.precision(), left.scale());
-    let mul = 10_f64.powi(left.scale() as i32);
     for i in 0..left.len() {
         if left.is_null(i) {
             decimal_builder.append_null()?;
         } else if right == 0 {
             return Err(DataFusionError::ArrowError(DivideByZero));
         } else {
-            let l_value = left.value(i) as f64;
-            let result = ((l_value / right as f64) * mul) as i128;
+            let result = divide_decimal_exact(left.value(i), right, left.precision(), left.scale())?;
             decimal_builder.append_value(result)?;
         }
     }
@@ -423,16 +473,13 @@ fn divide_decimal_scalar(left: &DecimalArray, right: i128) -> Result<DecimalArra
 fn divide_decimal(left: &DecimalArray, right: &DecimalArray) -> Result<DecimalArray> {
     let mut decimal_builder =
         DecimalBuilder::new(left.len(), left.precision(), left.scale());
-    let mul = 10_f64.powi(left.scale() as i32);
     for i in 0..left.len() {
         if left.is_null(i) || right.is_null(i) {
             decimal_builder.append_null()?;
         } else if right.value(i) == 0 {
             return Err(DataFusionError::ArrowError(DivideByZero));
         } else {
-            let l_value = left.value(i) as f64;
-            let r_value = right.value(i) as f64;
-            let result = ((l_value / r_value) * mul) as i128;
+            let result = divide_decimal_exact(left.value(i), right.value(i), left.precision(), left.scale())?;
             decimal_builder.append_value(result)?;
         }
     }
@@ -3420,6 +3467,135 @@ mod tests {
         let expect = create_decimal_array(&[Some(7), None, Some(37), Some(16)], 25, 3)?;
         assert_eq!(expect, result);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_decimal_division_exact_large_integer_and_sign() -> Result<()> {
+        let scale = 1_000_000_000_i128;
+        let numerator = 9_007_199_254_740_993_i128 * scale;
+        let expected = 3_002_399_751_580_331_i128 * scale;
+        assert_eq!(divide_decimal_exact(numerator, 3 * scale, 38, 9)?, expected);
+        assert_eq!(
+            divide_decimal_exact(-numerator, 3 * scale, 38, 9)?,
+            -expected
+        );
+        assert_eq!(
+            divide_decimal_exact(numerator, -3 * scale, 38, 9)?,
+            -expected
+        );
+        assert_eq!(
+            divide_decimal_exact(-numerator, -3 * scale, 38, 9)?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_decimal_division_bounded_remainder_and_truncation() -> Result<()> {
+        // Multiplying these remainders by ten would overflow i128/u128.
+        let numerator = 10_i128.pow(37);
+        assert_eq!(
+            divide_decimal_exact(numerator, 9 * numerator, 38, 9)?,
+            111_111_111
+        );
+        assert_eq!(
+            divide_decimal_exact(-numerator, 9 * numerator, 38, 9)?,
+            -111_111_111
+        );
+        assert_eq!(divide_decimal_exact(1, 3, 38, 9)?, 333_333_333);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decimal_division_matches_bounded_integer_reference() -> Result<()> {
+        let mut state = 27_u64;
+        for _ in 0..200 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let numerator = (state % 1_000_000_000_000) as i128 - 500_000_000_000;
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let denominator = (state % 999_999_999_999 + 1) as i128;
+            for scale in [0_usize, 3, 9] {
+                let expected = numerator * 10_i128.pow(scale as u32) / denominator;
+                assert_eq!(
+                    divide_decimal_exact(numerator, denominator, 38, scale)?,
+                    expected
+                );
+                assert_eq!(
+                    divide_decimal_exact(numerator, -denominator, 38, scale)?,
+                    -expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_decimal_division_array_scalar_null_and_zero() -> Result<()> {
+        let left = create_decimal_array(
+            &[Some(2_000_000_000), Some(0), None, Some(-2_000_000_000)],
+            38,
+            9,
+        )?;
+        let scalar = divide_decimal_scalar(&left, 10_000_000_000)?;
+        assert_eq!(
+            scalar,
+            create_decimal_array(
+                &[Some(200_000_000), Some(0), None, Some(-200_000_000)],
+                38,
+                9
+            )?
+        );
+        let right = create_decimal_array(
+            &[
+                Some(10_000_000_000),
+                Some(10_000_000_000),
+                Some(0),
+                Some(-10_000_000_000),
+            ],
+            38,
+            9,
+        )?;
+        assert_eq!(
+            divide_decimal(&left, &right)?,
+            create_decimal_array(
+                &[Some(200_000_000), Some(0), None, Some(200_000_000)],
+                38,
+                9
+            )?
+        );
+        assert!(divide_decimal_exact(1, 0, 38, 9).is_err());
+        assert!(divide_decimal_exact(10_i128.pow(38) - 1, 1, 38, 9).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_decimal_division_physical_coercion_preserves_counts() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Decimal(38, 9), true),
+            Field::new("b", DataType::Decimal(38, 9), true),
+        ]));
+        let left = Arc::new(create_decimal_array(
+            &[Some(2_000_000_000), Some(2_000_000_000)],
+            38,
+            9,
+        )?) as ArrayRef;
+        let right = Arc::new(create_decimal_array(
+            &[Some(10_000_000_000), Some(2_000_000_000)],
+            38,
+            9,
+        )?) as ArrayRef;
+        let expression = binary(
+            col("a", &schema)?,
+            Operator::Divide,
+            col("b", &schema)?,
+            &schema,
+        )?;
+        assert_eq!(expression.data_type(&schema)?, DataType::Decimal(38, 9));
+        let batch = RecordBatch::try_new(schema, vec![left, right])?;
+        let actual = expression.evaluate(&batch)?.into_array(batch.num_rows());
+        let expected = create_decimal_array(&[Some(200_000_000), Some(1_000_000_000)], 38, 9)?;
+        assert_eq!(actual.as_ref(), &expected);
         Ok(())
     }
 

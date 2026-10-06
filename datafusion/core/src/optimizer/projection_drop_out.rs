@@ -21,8 +21,8 @@
 use crate::error::{DataFusionError, Result};
 use crate::logical_plan::plan::{Aggregate, Projection, Sort, Subquery};
 use crate::logical_plan::{
-    normalize_col, replace_col_to_expr, unnormalize_col, Column, DFField, DFSchema,
-    Filter, LogicalPlan,
+    normalize_col, replace_col_to_expr, Column, DFField, DFSchema,
+    ExprRewritable, ExprRewriter, Filter, LogicalPlan,
 };
 use crate::optimizer::optimizer::OptimizerConfig;
 use crate::optimizer::optimizer::OptimizerRule;
@@ -358,7 +358,7 @@ fn rewrite_projection_expr(
         .map(|e| match replace_col_to_expr(e.clone(), &rewrite_map) {
             Ok(expr) => {
                 let old_name = expr_name(e, schema)?;
-                let new_e = normalize_col(unnormalize_col(expr), input)?;
+                let new_e = normalize_rewritten_expr(expr, input)?;
 
                 Ok(if old_name != expr_name(&new_e, schema)? {
                     Expr::Alias(Box::new(new_e), old_name)
@@ -385,7 +385,7 @@ fn rewrite_aggregate_expr(
             if let Ok(expr) = &expr {
                 let old_name = e.name(schema)?;
                 let new_name =
-                    normalize_col(unnormalize_col(expr.clone()), input)?.name(schema)?;
+                    normalize_rewritten_expr(expr.clone(), input)?.name(schema)?;
 
                 if old_name != new_name {
                     rewritten_map.insert(
@@ -407,6 +407,31 @@ fn expr_name(e: &Expr, schema: &Arc<DFSchema>) -> Result<String> {
         Expr::Column(col) => Ok(col.name.clone()),
         _ => e.name(schema),
     }
+}
+
+/// Keep surviving column qualifiers when removing a projection. A qualifier
+/// belonging to the removed projection can be remapped only to a unique input
+/// field; removing every qualifier can bind a self-join's right component to
+/// the same-named left column.
+fn normalize_rewritten_expr(expr: Expr, input: &LogicalPlan) -> Result<Expr> {
+    struct Requalify<'a>(&'a DFSchema);
+    impl ExprRewriter for Requalify<'_> {
+        fn mutate(&mut self, expr: Expr) -> Result<Expr> {
+            match expr {
+                Expr::Column(column)
+                    if column.relation.is_some() && self.0.field_from_column(&column).is_err() =>
+                {
+                    Ok(Expr::Column(
+                        self.0
+                            .field_with_unqualified_name(&column.name)?
+                            .qualified_column(),
+                    ))
+                }
+                other => Ok(other),
+            }
+        }
+    }
+    normalize_col(expr.rewrite(&mut Requalify(input.schema()))?, input)
 }
 
 fn merge_aggregate(parent: &Aggregate, child: &Aggregate) -> Option<Aggregate> {
@@ -1146,6 +1171,40 @@ mod tests {
 
         assert_optimized_plan_eq(&plan, expected);
 
+        Ok(())
+    }
+
+    #[test]
+    fn self_join_projection_preserves_qualified_component() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let fields = vec![col("a").alias("current"), col("b").alias("key")];
+        let right = LogicalPlanBuilder::from(table_scan.clone())
+            .project_with_alias(fields.clone(), Some("cmp".into()))?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project_with_alias(fields, Some("t".into()))?
+            .join(&right, JoinType::Left, (vec!["t.key"], vec!["cmp.key"]))?
+            .project_with_alias(
+                vec![
+                    col("t.current").alias("current"),
+                    col("cmp.current").alias("prior"),
+                ],
+                Some("compared".into()),
+            )?
+            .project_with_alias(
+                vec![
+                    col("compared.current").alias("current"),
+                    col("compared.prior").alias("prior"),
+                ],
+                Some("derived".into()),
+            )?
+            .build()?;
+        let optimized = optimize(&plan)?;
+        let LogicalPlan::Projection(projection) = optimized else {
+            panic!("Expected projection")
+        };
+        assert_eq!(projection.expr[0], col("t.current").alias("current"));
+        assert_eq!(projection.expr[1], col("cmp.current").alias("prior"));
         Ok(())
     }
 

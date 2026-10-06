@@ -27,7 +27,7 @@ use arrow::{array::ArrayRef, datatypes::Field};
 use datafusion_common::DataFusionError;
 use datafusion_common::Result;
 use datafusion_expr::Accumulator;
-use datafusion_expr::{WindowFrame, WindowFrameUnits};
+use datafusion_expr::{WindowFrame, WindowFrameBound, WindowFrameUnits};
 use std::any::Any;
 use std::iter::IntoIterator;
 use std::ops::Range;
@@ -111,11 +111,37 @@ impl AggregateWindowExpr {
         )))
     }
 
-    fn row_based_evaluate(&self, _batch: &RecordBatch) -> Result<ArrayRef> {
-        Err(DataFusionError::NotImplemented(format!(
-            "Row based evaluation for {} is not yet implemented",
-            self.name()
-        )))
+    fn row_based_evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        // This accumulator only grows: bounded or following frames require a
+        // different algorithm. Do not silently reinterpret them as cumulative.
+        match self.window_frame {
+            Some(WindowFrame {
+                units: WindowFrameUnits::Rows,
+                start_bound: WindowFrameBound::Preceding(None),
+                end_bound: WindowFrameBound::CurrentRow,
+            }) => (),
+            _ => return Err(DataFusionError::NotImplemented(format!(
+                "Row based evaluation for {} supports only ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                self.name()
+            ))),
+        }
+        let num_rows = batch.num_rows();
+        if num_rows == 0 {
+            return Ok(new_empty_array(self.aggregate.field()?.data_type()));
+        }
+        let partition_points =
+            self.evaluate_partition_points(num_rows, &self.partition_columns(batch)?)?;
+        let values = self.evaluate_args(batch)?;
+        let mut results = Vec::with_capacity(num_rows);
+        for partition in partition_points {
+            let mut accumulator = self.create_accumulator()?;
+            for row in partition {
+                // ROWS advances once per row, including duplicate ORDER BY peers.
+                results.push(accumulator.scan_peers(&values, &(row..row + 1))?);
+            }
+        }
+        let results = results.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
+        concat(&results).map_err(DataFusionError::ArrowError)
     }
 }
 
@@ -183,5 +209,82 @@ impl AggregateWindowAccumulator {
         self.accumulator.update_batch(&values)?;
         let value = self.accumulator.evaluate()?;
         Ok(value.to_array_of_size(len))
+    }
+}
+
+
+#[cfg(test)]
+mod cumulative_rows_tests {
+    use super::*;
+    use crate::expressions::{Column, Sum};
+    use arrow::array::{Array, Int64Array};
+    use arrow::compute::SortOptions;
+    use arrow::datatypes::{DataType, Schema};
+
+    fn batch(partitions: Vec<i64>, keys: Vec<i64>, values: Vec<Option<i64>>) -> RecordBatch {
+        RecordBatch::try_new(Arc::new(Schema::new(vec![
+            Field::new("partition", DataType::Int64, false),
+            Field::new("key", DataType::Int64, false),
+            Field::new("value", DataType::Int64, true),
+        ])), vec![Arc::new(Int64Array::from(partitions)), Arc::new(Int64Array::from(keys)),
+            Arc::new(Int64Array::from(values))]).unwrap()
+    }
+
+    fn window(units: WindowFrameUnits, start_bound: WindowFrameBound, end_bound: WindowFrameBound) -> AggregateWindowExpr {
+        AggregateWindowExpr::new(
+            Arc::new(Sum::new(Arc::new(Column::new("value", 2)), "SUM(value)", DataType::Int64)),
+            &[Arc::new(Column::new("partition", 0))],
+            &[PhysicalSortExpr { expr: Arc::new(Column::new("key", 1)), options: SortOptions::default() }],
+            Some(WindowFrame { units, start_bound, end_bound }),
+        )
+    }
+
+    fn values(array: &ArrayRef) -> Vec<Option<i64>> {
+        array.as_any().downcast_ref::<Int64Array>().unwrap().iter().collect()
+    }
+
+    #[test]
+    fn cumulative_rows_distinguishes_peers_nulls_and_partition_resets_from_range() {
+        let input = batch(vec![1, 1, 1, 1, 2, 2], vec![1, 1, 2, 3, 1, 1],
+            vec![None, Some(2), None, Some(3), Some(7), None]);
+        let rows = window(WindowFrameUnits::Rows, WindowFrameBound::Preceding(None), WindowFrameBound::CurrentRow);
+        assert_eq!(values(&rows.evaluate(&input).unwrap()), vec![None, Some(2), Some(2), Some(5), Some(7), Some(7)]);
+        let range = window(WindowFrameUnits::Range, WindowFrameBound::Preceding(None), WindowFrameBound::CurrentRow);
+        assert_eq!(values(&range.evaluate(&input).unwrap()), vec![Some(2), Some(2), Some(2), Some(5), Some(7), Some(7)]);
+    }
+
+    #[test]
+    fn cumulative_rows_handles_empty_and_all_null_partitions() {
+        let rows = window(WindowFrameUnits::Rows, WindowFrameBound::Preceding(None), WindowFrameBound::CurrentRow);
+        let empty = rows.evaluate(&batch(vec![], vec![], vec![])).unwrap();
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.data_type(), &DataType::Int64);
+        assert_eq!(values(&rows.evaluate(&batch(vec![1, 1, 2], vec![1, 2, 1], vec![None, None, None])).unwrap()), vec![None, None, None]);
+    }
+
+    #[test]
+    fn cumulative_rows_evaluates_full_input_before_late_selection_and_page() {
+        let input = batch(vec![1; 5], vec![1, 2, 3, 4, 5], vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
+        let rows = window(WindowFrameUnits::Rows, WindowFrameBound::Preceding(None), WindowFrameBound::CurrentRow);
+        let result = values(&rows.evaluate(&input).unwrap());
+        // A consumer selecting the final two rows sees prior source history,
+        // and paging after this evaluation retains the full cumulative state.
+        assert_eq!(&result[3..], &[Some(10), Some(15)]);
+        assert_eq!(result[4], Some(15));
+    }
+
+    #[test]
+    fn cumulative_rows_refuses_other_frames_without_reinterpreting_them() {
+        let input = batch(vec![1], vec![1], vec![Some(1)]);
+        for (start, end) in [
+            (WindowFrameBound::Preceding(Some(1)), WindowFrameBound::CurrentRow),
+            (WindowFrameBound::Preceding(None), WindowFrameBound::Following(Some(1))),
+            (WindowFrameBound::CurrentRow, WindowFrameBound::Following(None)),
+        ] {
+            let rows = window(WindowFrameUnits::Rows, start, end);
+            assert!(matches!(rows.evaluate(&input), Err(DataFusionError::NotImplemented(_))));
+        }
+        let groups = window(WindowFrameUnits::Groups, WindowFrameBound::Preceding(None), WindowFrameBound::CurrentRow);
+        assert!(matches!(groups.evaluate(&input), Err(DataFusionError::NotImplemented(_))));
     }
 }

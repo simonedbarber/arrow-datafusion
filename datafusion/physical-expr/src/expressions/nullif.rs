@@ -59,6 +59,19 @@ macro_rules! primitive_bool_array_op {
             DataType::UInt64 => compute_bool_array_op!($LEFT, $RIGHT, $OP, UInt64Array),
             DataType::Float32 => compute_bool_array_op!($LEFT, $RIGHT, $OP, Float32Array),
             DataType::Float64 => compute_bool_array_op!($LEFT, $RIGHT, $OP, Float64Array),
+            DataType::Decimal(precision, scale) => {
+                let left = $LEFT.as_any().downcast_ref::<DecimalArray>().unwrap();
+                let condition = $RIGHT.as_any().downcast_ref::<BooleanArray>().unwrap();
+                let mut builder = DecimalBuilder::new(left.len(), *precision, *scale);
+                for i in 0..left.len() {
+                    if left.is_null(i) || (condition.is_valid(i) && condition.value(i)) {
+                        builder.append_null()?;
+                    } else {
+                        builder.append_value(left.value(i))?;
+                    }
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
             other => Err(DataFusionError::Internal(format!(
                 "Unsupported data type {:?} for NULLIF/primitive/boolean operator",
                 other
@@ -131,6 +144,70 @@ pub fn nullif_func(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 mod tests {
     use super::*;
     use datafusion_common::Result;
+
+    fn decimal_array(values: &[Option<i128>]) -> Result<ColumnarValue> {
+        let mut builder = DecimalBuilder::new(values.len(), 38, 9);
+        for value in values {
+            match value {
+                Some(value) => builder.append_value(*value)?,
+                None => builder.append_null()?,
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+
+    fn assert_decimal_nullif(
+        left: ColumnarValue,
+        right: ColumnarValue,
+        expected: &[Option<i128>],
+    ) -> Result<()> {
+        let result = nullif_func(&[left, right])?.into_array(expected.len());
+        assert_eq!(result.data_type(), &DataType::Decimal(38, 9));
+        let expected = decimal_array(expected)?.into_array(expected.len());
+        assert_eq!(result.as_ref(), expected.as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn nullif_decimal_array_masks_without_rounding() -> Result<()> {
+        let large = 9007199254740993_i128 * 1_000_000_000;
+        assert_decimal_nullif(
+            decimal_array(&[Some(large), Some(large), Some(0), None, Some(2_000_000_000)])?,
+            decimal_array(&[
+                Some(large),
+                Some(large - 1),
+                Some(0),
+                Some(2_000_000_000),
+                None,
+            ])?,
+            &[None, Some(large), None, None, Some(2_000_000_000)],
+        )
+    }
+
+    #[test]
+    fn nullif_decimal_scalar_array_combinations_and_nulls() -> Result<()> {
+        let large = 9007199254740993_i128 * 1_000_000_000;
+        let scalar = |value| ColumnarValue::Scalar(ScalarValue::Decimal128(value, 38, 9));
+        assert_decimal_nullif(
+            decimal_array(&[Some(0), Some(2_000_000_000), None, Some(large)])?,
+            scalar(Some(2_000_000_000)),
+            &[Some(0), None, None, Some(large)],
+        )?;
+        assert_decimal_nullif(
+            scalar(Some(large)),
+            decimal_array(&[Some(large), Some(large - 1), None])?,
+            &[None, Some(large), Some(large)],
+        )?;
+        for (left, right, expected) in [
+            (Some(large), Some(large), None),
+            (Some(large), Some(large - 1), Some(large)),
+            (Some(large), None, Some(large)),
+            (None, Some(large), None),
+        ] {
+            assert_decimal_nullif(scalar(left), scalar(right), &[expected])?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn nullif_int32() -> Result<()> {

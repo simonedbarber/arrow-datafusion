@@ -16,19 +16,26 @@
 // under the License.
 
 use std::any::Any;
+use std::convert::TryFrom;
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::PhysicalExpr;
+use arrow::array::{ArrayRef, DecimalBuilder, LargeStringArray, StringArray};
 use arrow::compute;
 use arrow::compute::kernels;
 use arrow::compute::CastOptions;
 use arrow::datatypes::{DataType, Schema};
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use bigdecimal::BigDecimal;
 use compute::can_cast_types;
 use datafusion_common::ScalarValue;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::ColumnarValue;
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 
 /// provide DataFusion default cast options
 pub const DEFAULT_DATAFUSION_CAST_OPTIONS: CastOptions = CastOptions { safe: false };
@@ -102,17 +109,107 @@ pub fn cast_column(
     cast_options: &CastOptions,
 ) -> Result<ColumnarValue> {
     match value {
-        ColumnarValue::Array(array) => Ok(ColumnarValue::Array(
-            kernels::cast::cast_with_options(array, cast_type, cast_options)?,
-        )),
+        ColumnarValue::Array(array) => Ok(ColumnarValue::Array(cast_array(
+            array,
+            cast_type,
+            cast_options,
+        )?)),
         ColumnarValue::Scalar(scalar) => {
             let scalar_array = scalar.to_array();
-            let cast_array =
-                kernels::cast::cast_with_options(&scalar_array, cast_type, cast_options)?;
+            let cast_array = cast_array(&scalar_array, cast_type, cast_options)?;
             let cast_scalar = ScalarValue::try_from_array(&cast_array, 0)?;
             Ok(ColumnarValue::Scalar(cast_scalar))
         }
     }
+}
+
+// Arrow 13's text-to-decimal kernel parses through f64. Preserve exact text
+// coefficients here, at the existing physical cast owner. Other conversions
+// continue to use their existing Arrow kernel and options.
+fn cast_array(
+    array: &ArrayRef,
+    cast_type: &DataType,
+    cast_options: &CastOptions,
+) -> Result<ArrayRef> {
+    if let DataType::Decimal(precision, scale) = cast_type {
+        if matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+            if *precision == 0 || *precision > 38 || scale > precision {
+                return Err(DataFusionError::ArrowError(ArrowError::CastError(
+                    "Invalid decimal precision or scale".to_owned(),
+                )));
+            }
+            let mut builder = DecimalBuilder::new(array.len(), *precision, *scale);
+            let values: Box<dyn Iterator<Item = Option<&str>> + '_> =
+                if array.data_type() == &DataType::Utf8 {
+                    Box::new(array.as_any().downcast_ref::<StringArray>().unwrap().iter())
+                } else {
+                    Box::new(
+                        array
+                            .as_any()
+                            .downcast_ref::<LargeStringArray>()
+                            .unwrap()
+                            .iter(),
+                    )
+                };
+            for value in values {
+                match value {
+                    // Preserve the old kernel's empty-mantissa NULL contract.
+                    None | Some("") => builder.append_null()?,
+                    Some(value) => builder
+                        .append_value(exact_text_decimal(value, *precision, *scale)?)?,
+                }
+            }
+            return Ok(Arc::new(builder.finish()));
+        }
+    }
+    Ok(kernels::cast::cast_with_options(
+        array,
+        cast_type,
+        cast_options,
+    )?)
+}
+
+fn exact_text_decimal(value: &str, precision: usize, scale: usize) -> Result<i128> {
+    let invalid = || {
+        DataFusionError::ArrowError(ArrowError::CastError(format!(
+            "Cannot cast string to Decimal({}, {})",
+            precision, scale
+        )))
+    };
+    if precision == 0
+        || precision > 38
+        || scale > precision
+        || value.contains('_')
+        || value.trim() != value
+    {
+        return Err(invalid());
+    }
+    let decimal = BigDecimal::from_str(value).map_err(|_| invalid())?;
+    let (coefficient, input_scale) = decimal.as_bigint_and_exponent();
+    if coefficient == BigInt::from(0_u8) {
+        return Ok(0);
+    }
+    let digits = coefficient.to_str_radix(10).trim_start_matches('-').len() as i128;
+    let shift = scale as i128 - input_scale as i128;
+    // Bound exponent work before allocating a power: huge positive exponents
+    // overflow the declared precision, while huge negative exponents truncate
+    // to zero. Preserve the kernel's truncation toward zero at the target scale.
+    let scaled = if shift >= 0 {
+        if digits + shift > precision as i128 {
+            return Err(invalid());
+        }
+        coefficient * BigInt::from(10_u8).pow(shift as u32)
+    } else if -shift >= digits {
+        BigInt::from(0_u8)
+    } else {
+        let power = u32::try_from(-shift).map_err(|_| invalid())?;
+        coefficient / BigInt::from(10_u8).pow(power)
+    };
+    let bound = BigInt::from(10_u8).pow(precision as u32);
+    if scaled >= bound || scaled <= -bound {
+        return Err(invalid());
+    }
+    scaled.to_i128().ok_or_else(invalid)
 }
 
 /// Return a PhysicalExpression representing `expr` casted to
@@ -642,6 +739,97 @@ mod tests {
 
         let result = cast(col("a", &schema).unwrap(), &schema, DataType::LargeBinary);
         result.expect_err("expected Invalid CAST");
+    }
+
+    #[test]
+    fn exact_text_decimal_preserves_full_precision_for_scalar_and_string_arrays() {
+        let maximum = format!("{}.999999", "9".repeat(32));
+        let minimum = format!("-{}", maximum);
+        let input = [
+            None,
+            Some(""),
+            Some(maximum.as_str()),
+            Some(minimum.as_str()),
+            Some("9.007199254740993e9"),
+        ];
+        let expected = [
+            None,
+            None,
+            Some(10_i128.pow(38) - 1),
+            Some(-(10_i128.pow(38) - 1)),
+            Some(9007199254740993),
+        ];
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(input.to_vec())),
+            Arc::new(LargeStringArray::from(input.to_vec())),
+        ];
+        for input in arrays {
+            let output = cast_array(
+                &input,
+                &DataType::Decimal(38, 6),
+                &DEFAULT_DATAFUSION_CAST_OPTIONS,
+            )
+            .unwrap();
+            assert_eq!(output.data_type(), &DataType::Decimal(38, 6));
+            for (row, value) in expected.iter().enumerate() {
+                assert_eq!(
+                    ScalarValue::try_from_array(&output, row).unwrap(),
+                    ScalarValue::Decimal128(*value, 38, 6)
+                );
+            }
+        }
+        let scalar = cast_column(
+            &ColumnarValue::Scalar(ScalarValue::Utf8(Some(maximum))),
+            &DataType::Decimal(38, 6),
+            &DEFAULT_DATAFUSION_CAST_OPTIONS,
+        )
+        .unwrap();
+        match scalar {
+            ColumnarValue::Scalar(value) => assert_eq!(
+                value,
+                ScalarValue::Decimal128(Some(10_i128.pow(38) - 1), 38, 6)
+            ),
+            _ => panic!("Scalar CAST must retain scalar shape"),
+        }
+    }
+
+    #[test]
+    fn exact_text_decimal_bounds_exponents_and_preserves_truncation_toward_zero() {
+        assert_eq!(
+            exact_text_decimal("123.45678999", 38, 6).unwrap(),
+            123456789
+        );
+        assert_eq!(
+            exact_text_decimal("-123.45678999", 38, 6).unwrap(),
+            -123456789
+        );
+        assert_eq!(exact_text_decimal("99.9999", 4, 2).unwrap(), 9999);
+        assert_eq!(exact_text_decimal("1e-1000000000", 38, 6).unwrap(), 0);
+        assert_eq!(exact_text_decimal("-1e-1000000000", 38, 6).unwrap(), 0);
+        assert_eq!(exact_text_decimal("0e1000000000", 38, 6).unwrap(), 0);
+        for value in [
+            "1e1000000000",
+            "-1e1000000000",
+            "100000000000000000000000000000000",
+            "-100000000000000000000000000000000",
+        ] {
+            assert!(matches!(
+                exact_text_decimal(value, 38, 6),
+                Err(DataFusionError::ArrowError(ArrowError::CastError(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_text_decimal_rejects_nonfinite_invalid_and_out_of_precision_values() {
+        for value in ["NaN", "Infinity", "-inf", "1_0", " 1", "1 ", "not-a-number"] {
+            assert!(exact_text_decimal(value, 38, 6).is_err());
+        }
+        for (precision, scale) in [(0, 0), (39, 6), (5, 6)] {
+            assert!(exact_text_decimal("1", precision, scale).is_err());
+        }
+        assert!(exact_text_decimal("100", 4, 2).is_err());
+        assert!(exact_text_decimal("-100", 4, 2).is_err());
     }
 
     #[test]

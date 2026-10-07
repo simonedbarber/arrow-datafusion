@@ -39,6 +39,7 @@ regex_expressions = ["regex"]
 unicode_expressions = ["unicode-segmentation"]
 
 [dependencies]
+bigdecimal = "0.4"
 ahash = { version = "0.7", default-features = false }
 arrow = { git = 'https://github.com/cube-js/arrow-rs.git', rev = "837ddde06037034056b9faced3d8ea7073529cfc", features = ["prettyprint", "chrono-tz"] }
 blake2 = { version = "^0.10.2", optional = true }
@@ -50,6 +51,8 @@ datafusion-expr = { path = "../expr", version = "7.0.0" }
 hashbrown = { version = "0.12", features = ["raw"] }
 lazy_static = { version = "^1.4.0" }
 md-5 = { version = "^0.10.0", optional = true }
+num-bigint = "0.4"
+num-traits = "0.2"
 ordered-float = "2.10"
 paste = "^1.0"
 rand = "0.8"

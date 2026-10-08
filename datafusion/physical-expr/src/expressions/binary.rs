@@ -322,6 +322,18 @@ fn is_not_distinct_from_decimal(
     Ok(bool_builder.finish())
 }
 
+fn checked_decimal_add(left: i128, right: i128) -> Result<i128> {
+    left.checked_add(right).ok_or_else(|| {
+        DataFusionError::Execution("Decimal addition exceeds integer capacity".to_string())
+    })
+}
+
+fn checked_decimal_subtract(left: i128, right: i128) -> Result<i128> {
+    left.checked_sub(right).ok_or_else(|| {
+        DataFusionError::Execution("Decimal subtraction exceeds integer capacity".to_string())
+    })
+}
+
 fn add_decimal_scalar(left: &DecimalArray, right: i128) -> Result<DecimalArray> {
     let mut decimal_builder =
         DecimalBuilder::new(left.len(), left.precision(), left.scale());
@@ -329,7 +341,7 @@ fn add_decimal_scalar(left: &DecimalArray, right: i128) -> Result<DecimalArray> 
         if left.is_null(i) {
             decimal_builder.append_null()?;
         } else {
-            decimal_builder.append_value(left.value(i) + right)?;
+            decimal_builder.append_value(checked_decimal_add(left.value(i), right)?)?;
         }
     }
     Ok(decimal_builder.finish())
@@ -342,7 +354,7 @@ fn add_decimal(left: &DecimalArray, right: &DecimalArray) -> Result<DecimalArray
         if left.is_null(i) || right.is_null(i) {
             decimal_builder.append_null()?;
         } else {
-            decimal_builder.append_value(left.value(i) + right.value(i))?;
+            decimal_builder.append_value(checked_decimal_add(left.value(i), right.value(i))?)?;
         }
     }
     Ok(decimal_builder.finish())
@@ -355,7 +367,7 @@ fn subtract_decimal_scalar(left: &DecimalArray, right: i128) -> Result<DecimalAr
         if left.is_null(i) {
             decimal_builder.append_null()?;
         } else {
-            decimal_builder.append_value(left.value(i) - right)?;
+            decimal_builder.append_value(checked_decimal_subtract(left.value(i), right)?)?;
         }
     }
     Ok(decimal_builder.finish())
@@ -368,7 +380,7 @@ fn subtract_decimal(left: &DecimalArray, right: &DecimalArray) -> Result<Decimal
         if left.is_null(i) || right.is_null(i) {
             decimal_builder.append_null()?;
         } else {
-            decimal_builder.append_value(left.value(i) - right.value(i))?;
+            decimal_builder.append_value(checked_decimal_subtract(left.value(i), right.value(i))?)?;
         }
     }
     Ok(decimal_builder.finish())
@@ -3596,6 +3608,208 @@ mod tests {
         let actual = expression.evaluate(&batch)?.into_array(batch.num_rows());
         let expected = create_decimal_array(&[Some(200_000_000), Some(1_000_000_000)], 38, 9)?;
         assert_eq!(actual.as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decimal_conformance_sum_alias_ratio_and_exact_text() -> Result<()> {
+        use crate::expressions::{cast, nullif_func};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("d", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("0.1"),
+                    Some("-0.1"),
+                    Some("0.1"),
+                    None,
+                    Some("0"),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("0.2"),
+                    Some("-0.2"),
+                    Some("0.2"),
+                    Some("0.2"),
+                    Some("0"),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("0.3"),
+                    Some("0.3"),
+                    Some("0"),
+                    Some("0.3"),
+                    Some("2"),
+                ])),
+            ],
+        )?;
+        let decimal = |name: &str| cast(col(name, &schema)?, &schema, DataType::Decimal(38, 9));
+        let sum = binary(decimal("a")?, Operator::Plus, decimal("b")?, &schema)?;
+        let sums = sum.evaluate(&batch)?.into_array(batch.num_rows());
+        assert_eq!(sums.data_type(), &DataType::Decimal(38, 9));
+        assert_eq!(array_value_to_string(&sums, 0)?, "0.300000000");
+        assert_eq!(array_value_to_string(&sums, 1)?, "-0.300000000");
+        let denominator = decimal("d")?.evaluate(&batch)?;
+        let guarded = nullif_func(&[
+            denominator,
+            ColumnarValue::Scalar(ScalarValue::Decimal128(Some(0), 38, 9)),
+        ])?
+        .into_array(batch.num_rows());
+        // A materialized prior stage models canonical derived references:
+        // neither operand is inlined or round-tripped through f64.
+        let aliases = Arc::new(Schema::new(vec![
+            Field::new("sum_alias", DataType::Decimal(38, 9), true),
+            Field::new("den_alias", DataType::Decimal(38, 9), true),
+        ]));
+        let alias_batch = RecordBatch::try_new(aliases.clone(), vec![sums, guarded])?;
+        let ratio = binary(
+            col("sum_alias", &aliases)?,
+            Operator::Divide,
+            col("den_alias", &aliases)?,
+            &aliases,
+        )?;
+        let actual = ratio
+            .evaluate(&alias_batch)?
+            .into_array(alias_batch.num_rows());
+        assert_eq!(actual.data_type(), &DataType::Decimal(38, 9));
+        for (index, expected) in [
+            Some("1.000000000"),
+            Some("-1.000000000"),
+            None,
+            None,
+            Some("0.000000000"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            match expected {
+                Some(value) => assert_eq!(array_value_to_string(&actual, index)?, *value),
+                None => assert!(actual.is_null(index)),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_decimal_conformance_large_alias_nullif_and_plain_zero() -> Result<()> {
+        use crate::expressions::{cast, nullif_func};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Utf8, true),
+            Field::new("d", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("9007199254740993"),
+                    Some("1"),
+                    Some("1"),
+                    None,
+                    Some("0"),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("3"),
+                    Some("2"),
+                    Some("0"),
+                    Some("2"),
+                    Some("2"),
+                ])),
+            ],
+        )?;
+        let numerator = cast(col("n", &schema)?, &schema, DataType::Decimal(38, 9))?
+            .evaluate(&batch)?
+            .into_array(batch.num_rows());
+        let denominator = cast(col("d", &schema)?, &schema, DataType::Decimal(38, 9))?
+            .evaluate(&batch)?
+            .into_array(batch.num_rows());
+        assert_eq!(
+            array_value_to_string(&numerator, 0)?,
+            "9007199254740993.000000000"
+        );
+        let guarded = nullif_func(&[
+            ColumnarValue::Array(denominator.clone()),
+            ColumnarValue::Scalar(ScalarValue::Decimal128(Some(0), 38, 9)),
+        ])?
+        .into_array(batch.num_rows());
+        let aliases = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Decimal(38, 9), true),
+            Field::new("d", DataType::Decimal(38, 9), true),
+        ]));
+        let expression = binary(
+            col("n", &aliases)?,
+            Operator::Divide,
+            col("d", &aliases)?,
+            &aliases,
+        )?;
+        let alias_batch = RecordBatch::try_new(aliases.clone(), vec![numerator.clone(), guarded])?;
+        let actual = expression
+            .evaluate(&alias_batch)?
+            .into_array(alias_batch.num_rows());
+        for (index, expected) in [
+            Some("3002399751580331.000000000"),
+            Some("0.500000000"),
+            None,
+            None,
+            Some("0.000000000"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            match expected {
+                Some(value) => assert_eq!(array_value_to_string(&actual, index)?, *value),
+                None => assert!(actual.is_null(index)),
+            }
+        }
+        // Ordinary division retains its separate error policy on zero.
+        let unguarded = RecordBatch::try_new(aliases, vec![numerator, denominator])?;
+        assert!(expression.evaluate(&unguarded).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_decimal_conformance_checked_carry_and_no_outer_cast_recovery() -> Result<()> {
+        use crate::expressions::cast;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Decimal(18, 9), true),
+            Field::new("b", DataType::Decimal(18, 9), true),
+        ]));
+        let expression = binary(
+            col("a", &schema)?,
+            Operator::Plus,
+            col("b", &schema)?,
+            &schema,
+        )?;
+        assert_eq!(expression.data_type(&schema)?, DataType::Decimal(18, 9));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(create_decimal_array(
+                    &[Some(999_999_999_999_999_999)],
+                    18,
+                    9,
+                )?),
+                Arc::new(create_decimal_array(&[Some(1)], 18, 9)?),
+            ],
+        )?;
+        assert!(expression.evaluate(&batch).is_err());
+        assert!(cast(expression, &schema, DataType::Decimal(38, 9))?
+            .evaluate(&batch)
+            .is_err());
+        let max = 10_i128.pow(38) - 1;
+        let left = create_decimal_array(&[Some(max)], 38, 0)?;
+        let right = create_decimal_array(&[Some(max)], 38, 0)?;
+        // A declared decimal overflow is an error, never a panic or release-build wrap.
+        assert!(add_decimal(&left, &right).is_err());
+        assert!(add_decimal_scalar(&left, max).is_err());
+        let negative = create_decimal_array(&[Some(-max)], 38, 0)?;
+        assert!(subtract_decimal(&left, &negative).is_err());
+        assert!(subtract_decimal_scalar(&left, -max).is_err());
+        assert!(add_decimal(&negative, &negative).is_err());
+        assert!(add_decimal_scalar(&negative, -max).is_err());
+        assert!(subtract_decimal(&negative, &right).is_err());
+        assert!(subtract_decimal_scalar(&negative, max).is_err());
         Ok(())
     }
 
